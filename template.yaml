@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Voice-to-Notion Fire & Forget Pipeline (Gemini Edition)
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        AUDIO_BUCKET: !Ref AudioBucket
+
+Parameters:
+  GeminiApiKey:
+    Type: String
+    NoEcho: true
+    Description: Google Gemini API Key
+  NotionApiKey:
+    Type: String
+    NoEcho: true
+    Description: Notion Integration Token
+  NotionDatabaseId:
+    Type: String
+    Description: Notion Database ID to store transcripts
+  ApiKey:
+    Type: String
+    NoEcho: true
+    Description: x-api-key for API Gateway auth
+
+Resources:
+
+  # ── SQS Queue (breaks circular dep between S3 and Lambda) ──────────────────
+  AudioQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: voice-to-notion-audio-queue
+      VisibilityTimeout: 180        # must be >= Lambda timeout (120s)
+      MessageRetentionPeriod: 86400 # 1 day
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AudioDLQ.Arn
+        maxReceiveCount: 3
+
+  AudioDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: voice-to-notion-audio-dlq
+
+  # Allow S3 to send messages to the queue
+  AudioQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AudioQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt AudioQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::voice-to-notion-audio-${AWS::AccountId}"
+
+  # ── S3 Bucket ───────────────────────────────────────────────────────────────
+  AudioBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: AudioQueuePolicy   # ensure policy exists before bucket notification
+    Properties:
+      BucketName: !Sub "voice-to-notion-audio-${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: pending/
+            Queue: !GetAtt AudioQueue.Arn
+
+  # ── API Gateway ─────────────────────────────────────────────────────────────
+  VoiceApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          Quota:
+            Limit: 500
+            Period: MONTH
+          Throttle:
+            BurstLimit: 10
+            RateLimit: 5
+      BinaryMediaTypes:
+        - "audio/m4a"
+        - "audio/mpeg"
+        - "audio/mp4"
+        - "audio/wav"
+        - "audio/x-m4a"
+        - "multipart/form-data"
+        - "application/octet-stream"
+
+  # ── Lambda A: Upload Handler ────────────────────────────────────────────────
+  UploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: voice-to-notion-upload
+      CodeUri: functions/upload/
+      Handler: app.handler
+      Description: Receives audio from iOS Shortcut, saves to S3, returns 202
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref AudioBucket
+      Events:
+        Upload:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VoiceApi
+            Path: /upload
+            Method: POST
+
+  # ── Lambda B: Processor (Gemini + Notion) ──────────────────────────────────
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: voice-to-notion-processor
+      CodeUri: functions/processor/
+      Handler: app.handler
+      Timeout: 120
+      MemorySize: 512
+      Description: Transcribes audio via Gemini and writes to Notion
+      Environment:
+        Variables:
+          GEMINI_API_KEY: !Ref GeminiApiKey
+          NOTION_API_KEY: !Ref NotionApiKey
+          NOTION_DATABASE_ID: !Ref NotionDatabaseId
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref AudioBucket
+        - S3WritePolicy:
+            BucketName: !Ref AudioBucket
+        - SQSPollerPolicy:
+            QueueName: !GetAtt AudioQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:DeleteObject
+                - s3:CopyObject
+              Resource: !Sub "arn:aws:s3:::voice-to-notion-audio-${AWS::AccountId}/*"
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AudioQueue.Arn
+            BatchSize: 1
+
+Outputs:
+  UploadEndpoint:
+    Description: "POST audio to this URL from iOS Shortcut"
+    Value: !Sub "https://${VoiceApi}.execute-api.${AWS::Region}.amazonaws.com/prod/upload"
+  AudioBucketName:
+    Value: !Ref AudioBucket
+  AudioQueueUrl:
+    Value: !Ref AudioQueue
